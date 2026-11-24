@@ -8,9 +8,9 @@ import com.wiperspace.maas.engine.TermuxBridge
 
 class TermuxResultReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
-        val bundle: Bundle? = intent.getBundleExtra("com.termux.result")
-            ?: intent.getBundleExtra(("result"))
-            ?: intent.extras
+        val bundle: Bundle? = intent?.getBundleExtra("com.termux.result")
+            ?: intent?.getBundleExtra(("result"))
+            ?: intent?.extras
 
         val stdout = bundle?.getString("stdout")
             ?: bundle?.getString("com.termux.RUN_COMMAND_STDOUT")
