@@ -98,7 +98,7 @@ class MaaSStorageManager(private val context: Context) {
         } return size
     }
     fun getStorageSummary(): Map<String, Long> {
-        return mapof (
+        return mapOf (
             "sites" to getFolderSize(sitesDir),
             "databases" to getFolderSize(databaseDir),
             "backups" to getFolderSize(backupsDir),
