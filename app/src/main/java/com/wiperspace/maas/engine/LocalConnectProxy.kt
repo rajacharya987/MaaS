@@ -15,7 +15,7 @@ import kotlin.concurrent.thread
 
 object LocalConnectProxy {
     private const val DEFAULT_PORT = 8999
-    private val serverSocket: ServerSocket?=null
+    private var serverSocket: ServerSocket?=null
     private val isRunning = AtomicBoolean(false)
     private val threadPool = Executors.newCachedThreadPool { runnable ->
         Thread(runnable, "MaaS-HttpConnectProxy").apply { isDaemon = true }
@@ -73,7 +73,8 @@ object LocalConnectProxy {
                 val port : Int
                 if (target.contains(":")) {
                     val idx = target.lastIndexOf(':')
-                    host = target.substring(idx +1).toIntOrNull() ?: 443
+                    host = target.substring(0, idx).removePrefix("[").removeSuffix("]")
+                    port = target.substring(idx +1).toIntOrNull() ?: 443
                 } else {
                     host = target
                     port = 443
