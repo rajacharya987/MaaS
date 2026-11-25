@@ -17,7 +17,7 @@ data class SystemMetrics(
     val networkTxSpeedBytes : Long = 81_920L,
     val batteryPercent: Int = 85,
     val batteryTemperature: Float = 32.5f,
-    val ischarging: Boolean = true,
+    val isCharging: Boolean = true,
     val uptimeSeconds : Long = 0L,
     val localIpAddress : String = "127.0.0.1",
     val tunnelConnected : Boolean = false,

@@ -6,7 +6,7 @@ import android.database.sqlite.SQLiteDatabase
 import java.io.File
 data class QueryResult(
     val success: Boolean,
-    val column: List<String> = emptyList(),
+    val columns: List<String> = emptyList(),
     val rows: List<List<String>> = emptyList(),
     val affectedRows: Int = 0,
     val errorMessage : String? = null,
@@ -38,7 +38,7 @@ class LocalDatabaseManager(private val context: Context, private val storageMana
     }
 
     private fun initDefaultDatabase(){
-        val defaultDbFile = File(storageManager.databaseDir,"main.db")
+        val defaultDbFile = File(storageManager.databasesDir,"main.db")
         if(!defaultDbFile.exists()) {
             val db = SQLiteDatabase.openOrCreateDatabase(defaultDbFile, null)
             db.execSQL(
@@ -57,8 +57,9 @@ class LocalDatabaseManager(private val context: Context, private val storageMana
     }
 
     fun executeSql(dbName: String, sql: String): QueryResult {
-    val startTime = System.currentTimeMillis()
-    val dbFile = File(storageManager.databaseDir, if (dbName.endsWith(".db")) dbName else "$dbName.db")
+        val startTime = System.currentTimeMillis()
+        val dbFile =
+            File(storageManager.databasesDir, if (dbName.endsWith(".db")) dbName else "$dbName.db")
         if (!dbFile.exists()) {
             return QueryResult(success = false, errorMessage = "Database '$dbName' not found")
         }
@@ -67,62 +68,73 @@ class LocalDatabaseManager(private val context: Context, private val storageMana
         return try {
             db = SQLiteDatabase.openDatabase(dbFile.path, null, SQLiteDatabase.OPEN_READWRITE)
             val trimmedSql = sql.trim()
-            val isSelect = trymmedSql.startswith(
+            val isSelect = trimmedSql.startsWith(
                 "SELECT",
                 ignoreCase = true
             ) || trimmedSql.startsWith(
                 "PRAGMA",
                 ignoreCase = true
-            ) || trimmedSql.startsWith("EXPLAIN", ignoreCase = trye)
+            ) || trimmedSql.startsWith("EXPLAIN", ignoreCase = true)
 
             if (isSelect) {
                 cursor = db.rawQuery(trimmedSql, null)
                 val columns = cursor.columnNames.toList()
-                val rows = mutableListOf<String>()
-                for (i in 0 until cursor.columnCount) {
-                    row.add(cursor.getString(i) ?: "NULL")
+                val rows = mutableListOf<List<String>>()
+                while (cursor.moveToNext()) {
+                    val row = mutableListOf<String>()
+                    for (i in 0 until cursor.columnCount) {
+                        row.add(cursor.getString(i) ?: "NULL")
+                    }
+                    rows.add(row)
                 }
-                rows.add(row)
+                val duration = System.currentTimeMillis() - startTime
+                QueryResult(
+                    success = true,
+                    columns = columns,
+                    rows = rows,
+                    executionTimeMs = duration
+                )
+            } else {
+                db.execSQL(trimmedSql)
+                val duration = System.currentTimeMillis() - startTime
+                QueryResult(success = true, affectedRows = 1, executionTimeMs = duration)
             }
-            val duration = System.currentTimeMillis() - startTime
-            QueryResult(success = true, columns = columns, rows = rows, executionTimeMs = duration)
-        } else {
-            db.execSQL(trimmedSql)
-            val duration = System.currentTimeMillis() - startTime
-            QueryResult(success = true, affectedRows = 1, executionTimeMs = duration)
+        } catch (e: Exception) {
+            QueryResult(
+                success = false,
+                errorMessage = e.message,
+                executionTimeMs = System.currentTimeMillis() - startTime
+            )
+        } finally {
+            cursor?.close()
+            db?.close()
         }
-    } catch (e: Exception) {
-        QueryResult(success = false, errorMessage = e.message, executionTimeMs = System.currentTimeMillis() - startTime)
-    } finally {
-        cursor?.close()
-        db?.close()
+
+
+
+        fun redisSet(key: String, value: String, ttlSeconds: Long = 0L) {
+            val expires =
+                if (ttlSeconds > 0) System.currentTimeMillis() + (ttlSeconds * 1000) else 0L
+            redisStore[key] = RedisEntry(key = key, value = value, expiresAt = expires)
+        }
+
+        fun redisGet(key: String): String? {
+            val entry = redisStore[key] ?: return null
+            if (entry.isExpired) {
+                redisStore.remove(key)
+                return null
+            }
+            return entry.value
+        }
     }
-}
+        fun redisGetAll(): List<RedisEntry> {
+            val now = System.currentTimeMillis()
+            redisStore.entries.removeIf { it.value.expiresAt in 1 until now }
+            return redisStore.values.toList()
+        }
 
+        fun listDatabases(): List<String> {
+            return storageManager.databasesDir.listFiles { file -> file.extension == "db" }
+                ?.map { it.name } ?: emptyList()
 
-fun redisSet(key: String, value: ttlSeconds: Long = 0L) {
-    val expires = if (ttlSeconds > 0 ) System.currentTimeMillis() + (ttlSeconds* 1000) else 0L
-    redisStore[key] = RedisEntry(key = key, value = value , expiresAt = expires)
-}
-
-fun redisGet(key: String): String? {
-    val entry = redisStore[key] ?: return null
-    if (entry.isExpired) {
-        redisStore.remove(key)
-        return null
-    }
-    return entry.value
-}
-
-fun redisGetAll(): List<RedisEntry> {
-    val now = System.currentTimeMillis()
-    redisStore.entries.removeIf { it.value.expiresAt in  until now}
-    return redisStore.values.toList()
-}
-
-fun listDatabases(): List<String> {
-    return storageManager.databaseDir.listFiles { file -> file.extension == "db"}
-        ?.map {it.name} ?: emptyList()
-
-}
-
+        } }
