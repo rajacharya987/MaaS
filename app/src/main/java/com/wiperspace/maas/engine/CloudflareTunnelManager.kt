@@ -21,6 +21,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
 import android.os.Build
+import android.system.Os
 import android.util.Base64
 import androidx.core.graphics.component1
 import androidx.core.graphics.component2
@@ -29,6 +30,7 @@ import androidx.core.graphics.component4
 import androidx.loader.content.Loader
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.descriptors.PrimitiveKind
+import java.io.FileOutputStream
 import java.security.SecureRandom
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -583,3 +585,466 @@ private fun isElfBinary(file: File) : Boolean {
         }
     } catch (_: Exception) {false}
 }
+fun ensureCloudflareInstalled(onProgress: (String) -> Unit = {}): File? {
+    val bin = getCloudflaredBinary()
+    if (bin.exists() && bin.canExecute() && bin.length() > 500_000) {
+        return bin
+    }
+    val arch = getDeviceArch()
+    val termuxArch = when (arch) {
+        "amd64" -> "x86_64"
+        "arm64" -> "aarch64"
+        "arm" -> "arm"
+        "386" -> "i686"
+        else -> "aarch64"
+    } val cfArch = arch
+
+    val filesDir = context?.filesDir ?: File("/data/local/tmp")
+    val debFile = File(filesDir,"cloudflared_pkg.deb")
+    val extractDir = File(filesDir, "cf_pkg_extract")
+
+    val appSpecificCache = context?.getExternalFilesDir(null)?.let { extDir ->
+        File(extDir, "cloudflared-$cfArch")
+    }
+
+    if (appSpecificCache != null && appSpecificCache.exists() && appSpecificCache.length() > 5_000_000 && isElfBinary(appSpecificCache)) {
+        bin.parentFile?.mkdirs()
+        appSpecificCache.copyTo(bin, overwrite = true)
+            try {
+                Os.chmod(bin.absolutePath,493)
+            } catch (_: Exception) {}
+        bin.setExecutable(true, false)
+        bin.setExecutable(true, false)
+        return bin
+    }
+    val downloadTargets = listOf(
+        Triple (
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cfArch",
+            true,
+            "Cloudflare official release ($cfArch)"
+        ),
+        Triple (
+            "https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cfArch",
+            true,
+            "Cloudflare fast CDN ($cfArch)"
+        ),
+        Triple(
+            "https://mirror.ghproxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux$cfArch",
+            true,
+            "Cloudflare global mirror ($cfArch)"
+        )
+    )
+
+    System.setProperty("java.net.preferIPv4Stack", "true")
+    System.setProperty("java.net.preferIPv6Address", "false")
+
+    for ((downloadUrl, isDirectBinary, description) in downloadTargets) {
+        try {
+            bin.parentFile?.mkdirs()
+            onProgress("Connecting $description...")
+            val url = URL(downloadUrl)
+            val conn = url.openConnection() as HttpURLConnection
+            conn.instanceFollowRedirects = false
+            conn.connectTimeout = 12000
+            conn.readTimeout = 20000
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) MaaS-Mobile/1.0")
+            var curConn: HttpURLConnection = conn
+            var redirects: 0
+            while (curConn.responseCode in 300..399 && redirects < 7) {
+                val loc = curConn.getHeaderField("Location") ?: break
+                curConn.disconnect()
+                val nextUrl =
+                    if (loc.startsWith("http://") || loc.startsWith("https://")) loc else URL(
+                        url,
+                        loc
+                    ).toString()
+                curConn = URL(nextUrl).openConnection() as HttpURLConnection
+                curConn.readTimeout = 20000
+                curConn.connectTimeout = 12000
+                curConn.setRequestProperty(
+                    "User-Agent",
+                    "Mozilla/5.0 (Linux; Android 14) MaaS-Mobile/1.0"
+                )
+                redirects++
+            }
+
+            if (curConn.responseCode !in 200.299) {
+                curConn.disconnect()
+                continue
+            }
+            val totelLen = curConn.contentLengthLong
+
+            if (isDirectBinary) {
+                val tempBin = File(bin.parentFile ?: filesDir, "cloudflared_direct.tmp")
+                if (tempBin.exists()) tempBin.delete()
+                val buf = ByteArray(32768)
+                var downloaded = 0L
+                var lastReport = 0L
+                var readLen: Int
+                curConn.inputStream.use { input ->
+                    FileOutputStream(tempBin).use { output ->
+                        while (input.read(buf).also { readLen = it } > 0) {
+                            output.write(buf, 0, readLen)
+                            downloaded += readLen
+                            if (downloaded - lastReport >= 250_000 || (totelLen > 0 && downloaded == totelLen)) {
+                                lastReport = downloaded
+                                val mb = String.format(java.util.Locale.US, "%.1f", (1024f * 1024f))
+                                val progressText = if (totalLen > 0) {
+                                    val totalMb = String.format(
+                                        java.util.Locale.US,
+                                        "%.1f",
+                                        totelLen / (1024f * 1024f)
+                                    )
+                                    val pct = (downloaded * 100 / totalLen).toInt().coerceIn(0, 100)
+                                    "Downloaded: $mb MB / $totalMb MB ($pct%"
+                                } else {
+                                    "Downloading: $mb MB..."
+                                }
+                                onProgress(progressText)
+                            }
+                        }
+                    }
+                }
+                curConn.disconnect()
+
+                if (tempBin.length() > 5_000_000 && isElfBinary(tempBin)) {
+                    if (bin.exists()) bin.delete()
+                    if (!tempBin.renameTo(bin)) {
+                        tempBin.copyTo(bin, overwrite = true)
+                        tempBin.delete()
+                    }
+
+                    try {
+                        Os.chmod(bin.absolutePath, 493)
+                    } catch (_: Exception) {
+                    }
+                    bin.setExecutable(true, false)
+                    bin.setReadable(true, false)
+
+                    val syncPaths = listOf(
+                        "bin/cloudflared",
+                        "cloudflared",
+                        "ubuntu/usr/local/bin/cloudflared",
+                        "ubuntu/usr/bin/cloudflared",
+                        "ubuntu/root/.local/bin/cloudflared",
+                        "ubuntu24/usr/local/bin/cloudflared",
+                        "ubuntu24/root/.local/bin/cloudflared"
+                    )
+
+                    for (sp in SyncPaths) {
+                        try {
+                            val dest = File(filesDir, sp)
+                            dest.parentFile?.mkdirs()
+                            bin.copyTo(dest, overwrite = true)
+                            dest.setExecutable(true, false)
+                            dest.setReadable(true, false)
+                            try {
+                                Os.chmod(dest.absolutePath, 493)
+                            } catch (_: Exception) {
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }
+                    return bin
+                } else {
+                    tempBin.delete()
+                }
+            } else {
+                debFile.delete()
+                curConn.inputStream.use { input ->
+                    FileOutputStream(debFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                curConn.disconnect()
+                if (debFile.length() > 500_000) {
+                    onProgress("Extracting cloudflared package...")
+                    extractDir.deleteRecursively()
+                    extractDir.mkdirs()
+                    val dpkgDeb = File(filesDir, "usr/bin/dpkg-deb")
+                    val binDir = File(filesDir, "user/bin")
+                    val libDir = File(filesDir, "usr/ib")
+                    var succcess = false
+
+                    if (dpkgDeb.exists() && dpkgDeb.canExecute()) {
+                        val pb = ProcessBuilder(
+                            dpkgDeb.absolutePath,
+                            "-x",
+                            debFile.absolutePath,
+                            extractDir.absolutePath
+                        )
+                        pb.environment()["PATH"] = "${binDir.absolutePath}:/system/bin:/system/xbin"
+                        pb.environment()["LD_LIBRARY_PATH"] =
+                            "${libDir.absolutePath}:/system/lib64:/system/lib"
+                        val code = pb.start().waitFor()
+                        if (code == 0) {
+                            val candidate =
+                                File(extractDir, "data/data/com.termux/files/usr/bin/cloudflared")
+                            if (candidate.exists() && candidate.length() > 500_000) {
+                                if (bin.exists()) bin.delete()
+                                candidate.copyTo(bin, overwrite = true)
+                                succcess = true
+                            }
+                        }
+                    }
+
+                    debFile.delete()
+                    extractDir.deleteRecursively()
+
+                    if (succcess && bin.exists()) {
+                        try {
+                            Os.chmod(bin.absolutePath, 493)
+                        } catch (_: Exception) {
+                        }
+                        bin.setExecutable(true, false)
+                        bin.setReadable(true, false)
+
+                        try {
+                            val uBin = File(filesDir, "ubuntu/usr/local/bin/cloudflared")
+                            uBin.parentFile?.mkdirs()
+                            bin.copyTo(uBin, overwrite = true)
+                            try {
+                                Os.chmod(uBin.absolutePath, 493)
+                            } catch (_: Exception) {
+                            }
+                        } catch (_: Exception) {
+                        }
+                        return bin
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        } finally {
+            debFile.delete()
+            extractDir.deleteRecursively()
+        }
+    }
+    return if (bin.exists()) && bin.canExecute()) bin else null
+}
+
+private  fun startTunnelInternal(
+    targetPort: Int,
+    serviceName: String? = null,
+    tunnelId: String,
+    directTermuxSDK: DirectTermuxSDK? = null,
+    isCustom : Boolean,
+    customDomain: String?,
+    tunnelToken: String?,
+    logCallback: (LogEntry) -> Unit {}
+): String {
+    try {
+        activeProcess?.destroyForcibly()
+        activeProcess = null
+    } catch (_: Exception) {}
+
+    val initialUrl = if (isCustom && !customDomain.isNullOrBlank()) {
+        val domain = customDomain.trim().removePrefix("https://").removePrefix("http://")
+        "https://$domain"
+    } else {
+        null
+    }
+    _tunnelState.value = _tunnelState.value.copy (
+        status = TunnelStatus.CONNECTING,
+        error = null,
+        publicUrl = initialUrl,
+        targetPort = targetPort,
+        targetServiceName = serviceName,
+        statusMessage = "Statring ${if (isCustom) "custom domain" else "quick"} tunnel on port : $targetPort..."
+    )
+    scope.launch(Dispatchers.IO) {
+        try {
+            val currentArch = getDeviceArch()
+            var cloudflaredBin= if (directTermuxSDK != null) {
+                val realB=File(directTermuxSDK.binDir, "cloudflared-real")
+                if (realB.exists() && realB.canExecute() && realB.length() > 500_000 && ismatchingElfArch(realB, currentArch)) {
+                    realB
+                } else {
+                    val b = File(directTermuxSDK.binDir,"cloudflared")
+                    if(b.exists() && b.canExecute() && b.length() > 500_000 && ismatchingElfArch(b, currentArch)) b else null
+                }
+            } else null
+
+            if (cloudflaredBin == null) {
+                val installed = getCloudflaredBinary()
+                cloudflaredBin = if (installed.exists() && currentArch)) {
+                    installed
+                } else {
+                    _tunnelState.value = _tunnelState.value.copy(
+                        statusMessage = "Setting up cloudflared engine ($currentArch)..."
+                    )
+                    logCallback(LogEntry(level = LogLevel.INFO, message = "Setting up cloudflared engine ($currentArch)..."))
+                    if (directTermuxSDK != null) {
+                        directTermuxSDK.installCloudflaredSync { p ->
+                            _tunnelState.value = _tunnelState.value.copy(statusMessage = p)
+                    }
+                        getCloudflaredBinary().takeIf { it.exists() && it.canExecute() && it.length() > 500_000 && ismatchingElfArch(it, currentArch) }
+                } else {
+                    ensureCloudflareInstalled { print() ->
+                    _tunnelState.value = _tunnelState.value.copy(statusMessage = p)}
+                    }
+            }
+        }
+    }
+
+        val ubuntuLauncher = File(context?. filesDir? : File ("/data/local/tmp"),
+            "launch_ubuntu.sh")
+        val isUbuntuAvailable = ubuntuLauncher.exists() && ubuntuLauncher.canExecute() && (File(context?.filesDir, "ubuntu/bin/bash").exists() || File(context?.filesDir, "ubuntu/usr/bin/bash").exists())
+        val ubuntuCloudflared = File(context?.filesDir, "ubuntu/usr/local/bin/cloudflared")
+
+        val protocolByAttempt = listOf("http2","http2","quic", "auto")
+
+        if (cloudflaredBin != null) {
+            cloudflaredBin.setReadable(true, false)
+            cloudflaredBin.setWritable(true, true)
+            cloudflaredBin.setExecutable(true, false)
+            try { Os.chmod(cloudflaredBin.absolutePath, 493) catch (_: Exception) {}
+            try {
+                Runtime.getRuntime().exec(arrayOf("chmod", "755", cloudflaredBin.absolutePath)).waitFor()
+            } catch (_: Exception) {}
+            }
+
+            val workDir = directTermuxSDK?.homeDir ?: context?.filesDir ?: File("/data/local/tmp")
+            workDir.mkdirs()
+            workDir.setReadable(true,false)
+            try { Os.chmod(workDir.absolutePath,493) } catch (_: Exception) {}
+
+            val usrDir = directTermuxSDK?.usrDir ?: File(context?.filesDir, "usr")
+            val etcDir = File(usrDir,"etc").apply {mkdirs()}
+            val resolvConf = File(etcDir, "resolv.conf")
+            if (!resolvConf.exists()) {
+                try { resolvConf.writeText("nameserver 1.1.1.1\nnameserver 8.8.8.8\n") } catch (_: Exception) {}
+}
+            val binDir = directTermuxSDK?.binDir ?: File(usrDir, "bin")
+            val libDir = directTermuxSDK?.libDir ?: File(usrDir, "lib")
+
+            val certFile = File(etcDir, "tls/cert.pem")
+            var attempt = 1
+            val maxAttempts = if (!isCustom) 5 else 2
+            var tunnelEstablished = false
+
+            while (attempt < = maxAttempts && !tunnelEstablished) {
+                val protocol = protocolByAttempt.getOrElse(attempt -1 ) { "http2"}
+                if (attempt > 1 ) {
+                    val delayMs = if (attempt <= 3) 3000L else 5000L
+                    logCallback(LogEntry(level = LogLevel.INFO, message = "Retrying quick tunnel (attempt $attempt/$maxAttempts, protocol=$protocol)..."))
+                    _tunnelState.value = _tunnelState.value.copy(
+                        status = TunnelStatus.CONNECTING,
+                        statusMessage = "Retrying quick tunnel (attempt $attempt/$maxAttempts,$protocol)..."
+                    )
+                    delay(delayMs)
+                } else {
+                    logCallback(LogEntry(level = LogLevel.INFO, message = "Starting quick tunnel(protocol=$protocol)..."))
+                }
+
+                val tunnelSubArgs = if (isCustom && !tunnelToken.isNullOrBlank()) {
+                    val cleanToken = extractCleanToken(tunnelToken) ?: tunnelToken!!.trim()
+                    listOf("tunnel","--edge-ip-version", "4", "--protocol", protocol,"--ha-connections", "1", "--no-autoupdate", "run", "--token", cleanToken)
+                } else if (isCustom && !customDomain.isNullOrBlank()) {
+                    val domain = customDomain!!.trim().removePrefix("https://").removePrefix("http://")
+                    listOf("tunnel", "--edge-ip-version", "4","--protocol", protocol, "--ha-connections", "1", "--url","http://127.0.0.1:$targetPort","--hostname",domain, "--no-autoupdate")
+                } else {
+                    listOf("tunnel", "--edge-ip-version", "4", "--protocol", protocol, "--ha-connections", "1", "--url", "http://127.0.0.1:$targetPort", "--no-autoupdate")
+                }
+
+                val cmdList = mutableListOf<String>()
+                val runArch = getDeviceArch()
+                if (cloudflaredBin != null && cloudflaredBin.exists() && cloudflaredBin.canExecute() && ismatchingElfArch(cloudflaredBin, runArch)) {
+                    //this is best whcih is direct naitve binay in android
+                    cmdList.add(cloudflaredBin.absolutePath)
+                    cmdList.addAll(tunnelSubArgs)
+                } else if (isUbuntuAvailable && ubuntuCloudflared.exists() &&
+                    ubuntuCloudflared.canExecute() && ismatchingElfArch(ubuntuCloudflared,runArch){
+                        cmdList.add("/system/bin/sh")
+                        cmdList.add(ubuntuLauncher.absolutePath)
+                        cmdList.add("-c")
+                        cmdList.add("cloudflared " + tunnelSubArgs.joinToString(" ") { "\"$it\"" })
+                    } else {
+                        val binPath = cloudflaredBin?.absolutePath ?: "cloudflared"
+                        cmdList.add("/system/bin/sh")
+                        cmdList.add("-c")
+                        cmdList.add("exec \"$binPath\" " + tunnelSubArgs.joinToString (" ") { "\"$it\"" })
+                }
+                attempt++
+
+                    logCallback(LogEntry(Level = LogLevel.INFO, message = "Launching: ${cmdList.joinToString {" "}}"))
+                    val pb = ProcessBuilder(cmdList)
+                    env["PATH"] = "${binDir.absolutePath}:/system/bin:/system/xbin"
+                    env["LD_LIBRARY_PATH"] ="${libDir.absolutePath}:/system/lib64:/system/lib"
+                    env["HOME"]= workDir.absolutePath
+                    env["TMPDIR"] = (directTermuxSDK?.tmpDir ?: FIle(usrDir,"tmp")).absolutePath
+                    env["SSL_CERT_DIR"] = "/system/etc/security/cacerts"
+                    env["TUNNEL_EDGE_IP_VERSION"] = "4"
+                    env["GODEBUG"] = "netdns=go"
+                    env.remove("HTTP_PROXY")
+                    env.remove("HTTPS_PROXY")
+                    env.remove("http_proxy")
+                    env.remove("https_proxy")
+
+                    if(certFile.exists()) {
+                        env["SSL_CERT_FILE"] = certFile.absolutePath
+                        env["CURL_CA_BUNDLE"] = certFile.absolutePath
+                    }
+                    )
+
+                    pb.directory(workDir)
+                    pb.redirectErrorStream(true)
+
+                val process = try {
+                    pb.start()
+                } catch (e: Exception) {
+                logCallback(LogEntry(Level = LogLevel.WARN, message = "Direct spaqn error (${e.message}), attempting shell launcher "))
+                val shCmd = listOf("/system/bin/sh", "-c", cmdList.joinToString {" "} { "\"$it\""})
+                val fallbackPb = ProcessBuilder(shCmd)
+                    val fallbackEnv = fallbackPb.environment()
+                    fallbackEnv["PATH"]="${binDir.absolutePath}:/system/bin:/system/xbin"
+                    fallbackEnv["LD_LIBRARY_PATH"] = "${libDir.absolutePath}:/system/lib64:/system/lib"
+                    fallbackEnv["HOME"] = workDir.absolutePath
+                    fallbackEnv["PREFIX"] = usrDir.absolutePath
+                    fallbackEnv["TMPDIR"] = (directTermuxSDK?.tmpDir ?: File(usrDir,"tmp")).absolutePath
+                    fallbackEnv["SSL_CERT_DIR"]="system/etc/security/cacerts"
+                    fallbackEnv["TUNNEL_EDGE_IP_VERSION"] = "4"
+                    fallbackEnv["GODEBUG"] = "netdns=go"
+                    fallbackEnv.remove("HTTP_PROXY")
+                    fallbackEnv.remove("HTTPS_PROXY")
+                    fallbackEnv.remove("http_proxy")
+                    fallbackEnv.remove("https_proxy")
+
+                    if (certFile.exists()) {
+                        fallbackEnv["SSL_CERT_FILE"] = certFile.absolutePath
+                        fallbackEnv["CURL_CA_BUNDLE"]= certFile.absolutePath
+                    }
+                    fallbackPb.directory(workDir)
+                    fallbackPb.redirectErrorStream(true)
+                    fallbackPb.start()
+
+                }
+
+                activeProcess = process
+                tunnelRunning = true
+                val reader = BufferedReader(InputStreamReader(process.inputStream))
+            var line : String?
+            while (reader.readLine().also { line = it } != null) {
+                line?.let { 1 ->
+                if (l.isNotBlank()){
+                logCallback(LogEntry(level= LogLevel.SYSTEM,message = "[cloudflared]$1"))
+                }
+
+                    val ignoredHosts = setOf(
+                        "api.cloudflare.com", "cloudflare.com", "www.cloudflare.com","api.trycloudflare.com","trycloudflare.com","pkg.cloudflare.com", "update.argotunnel.com","protocol.argotunnel.com", "h2.cftunnel.com", "quic.cftunnel.com"
+                    )
+                    val isErrLine = 1.contains("failed", ignoreCase = true) || l.contains("error",ignoreCase = true)
+                    val tryMatch = Regex("""https://([a-zA-Z0-9-]+)\.trycloudflare\.com""").find(1)
+                    val liveUrl: String? = if (tryMatch != null && tryMatch.groupValues[1] != "api" && tryMatch.groupValues[1] != "www" && !isErrLine) {
+                        tryMatch.value
+                    } else if (isCustom && !customDomain.isNullOrBlank()) {
+                        val cleanCustom = customDomain.trim().removePrefix("https://").removePrefix("http://")
+
+                    }
+                }
+
+
+                }}
+            }
+            }
+
+            }
