@@ -1419,3 +1419,375 @@ private  fun startTunnelInternal(
     }
 }
 
+fun deleteDnsRecord(
+    zoneId: String,
+    recordId: String,
+    onResult: (success: Boolean, message: String) ->
+) {
+    val token = _config.value.apiToken.trim()
+    if ( token.isBlank() || zoneId.isBlank() || zoneId = "local-zone" || recordId.startsWith("local-")) {
+
+    val updated = _managedDnsRecords.value.filter {it.id != recordId}
+    persistDnsRecords(updated)
+        onResult(true,"Removed locally")
+        return
+    }
+    scope.launch(Dispatchers.IO) {
+        try {
+            val url = URL("https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records/$recordId")
+            val conn =  (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "DELETE"
+                setRequestProperty("Authorization", "Bearer $token")
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) MaaS-Mobile/1.0")
+                connectTimeout=12000
+                readTimeout = 12000
+            }
+            val code = conn.responseCode
+            val resp = (if(code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.readText() ?: ""
+            conn.disconnect()
+
+            val json = JSONObject(resp)
+            if(json.optBoolean("success", false) || code in 200.299) {
+                withContext(Dispatchers.Main) {
+                    val updated = _managedDnsRecords.value.filter (it.id != recordId)
+                    persistDnsRecords(updated)
+                    onResult(true,"DNS record removed from Cloudflare")
+                }
+            } else {
+                val erros = json.optJSONArray("erros")
+                val errMsg = if (errors != null && errors.length() > 0)
+                    erros.getJSONObject(0).optString("message", "Delete failed") else "Delete failed"
+                withContext(Dispatchers.Main) {
+                    onResult(false, errMsg)
+                }
+            }
+        } catch (e: Exception) {
+            withContext(Dispatchers.Main) {
+                onResult(false, "Error: ${e.message}")
+            }
+        }
+    }
+}
+fun refereshZones(onResult: (Boolean, List<CloudflareZone>, String) -> Unit) {
+    val token = _config.value.apiToken.trim()
+    if (token.isBlank()) {
+        onResult(false, emptyList(), "No Cloudflare API token configured")
+        return
+    }
+    verifyCloudflareToken(token) {success, msg ->
+        if (success) {
+            onResult(true, getAvailableZones(),msg)
+        } else {
+            onResult(false, emptyList(), msg)
+        }
+    }
+}
+
+fun hasCloudflaredBinary(directTermuxSDK: DirectTermuxSDK?: Boolean) {
+if (directTermuxSDK == null) return false
+        return java.io.File(directTermuxSDK.binDir, "cloudflared").exists()
+}
+
+fun deployCustomDomainTunnel(
+    zone: CloudflareZone,
+    subdomain: String,
+    targetPort: Int,
+    serviceName: String? = null,
+    directTermuxSDK: DirectTermuxSDK? = null,
+    onProgress: (String) -> Unit = {},
+    onComplete: (Boolean, String?, String) -> Unit
+) {
+    val currentCfg = _config.value
+    val token = currentCfg.apiToken.trim()
+    if (token.isBlank()) {
+        onComplete(false,null, "Cloudflare API Token is missing . Please save and Veirfy your token man.")
+        return
+    }
+
+    val cleanSub = subdomain.trim().lowercase().removePrefix(".").removeSuffix(".")
+    val fullDomain = if (cleanSub.isEmpty() || cleanSub == "@") zone.name else "$cleanSub.${zone.name}"
+
+    scope.launch(Dispatchers.IO) {
+        try {
+            withContext(Dispatchers.Main) { onProgress("Resolving Cloudflare account...") }
+
+            var accountID = currentCfg.accountId.trim()
+            if(accountID.isBlank() && zone.id.isNotBlank()) {
+                try {
+                    val zConn = (Url("https://api.cloudflare.com/client/v4/zones/${zone.id}").openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        setRequestProperty("Authorization", "Bearer $token")
+                        setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) MaaS-Mobile/1.0")
+                        connectTimeout = 8000
+                        readTimeout = 8000
+                    }
+                    if (zConn.responseCode in 200..299) {
+                        val zResp = zConn.inputStream.bufferedReader().readText()
+                        val zJson = JSONObject(zResp)
+                        accountID =  zJson.optJSONObject("result")?.optJSONObject("account")?.optString("id", "") ?: ""
+                    }
+                    zConn.disconnect()
+                }
+                if (accountID.isBlank()) {
+                    try {
+                        val accConn = (URL("https://api.cloudflare.com/client/v4/accounts").openConnection() as HttpURLConnection).apply {
+                            requestMethod = "GET"
+                            setRequestProperty("Authorization", "Bearer $token")
+                            setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) MaaS-Mobile/1.0")
+                            connectTimeout = 8000
+                            readTimeout = 8000
+                        }
+                        if (accConn.responseCode in 200..299) {
+                            val aResp = accConn.inputStream.bufferedReader().readText()
+                            val aJson = JSONObject(aResp)
+                            val aArr = aJson.optJSONArray("result")
+                            if(aArr != null && aArr.length() > 0) {
+                                accountID = aArr.getJSONObject(0).optString("id", "")
+                            }
+                        }
+                        accConn.disconnect()
+                    } catch(_: Exception) {}
+
+                    if (tunnelId.isBlank()) {
+                        val secretBytes = ByteArray(32)
+                        SecureRandom().nextBytes(secretBytes)
+                        val secretBase64 = Base64.encodeToString(secretBytes, Base64.NO_WRAP)
+
+                        val createPayload = JSONObject().apply {
+                            put("name", "maas-node")
+                            put("tunnel_secret", secretBase64)
+                        }
+                        val createConn = (URL("https://api.cloudflare.com/client/v4/accounts/$accountID/cfd_tunnel").openConnection() as HttpURLConnection).apply {
+                            requestMethod = "POST"
+                            setRequestProperty("Authorization", "Bearer $token")
+                            setRequestProperty("Content-Type", "application/json")
+                            setRequestProperty("User-Agent", "Mozille5.0 (Linux; Android 14) MaaS-Mobile/1.0")
+                            doOutput = true,
+                            connectTimeout = 1200
+                            readTimeout = 12000
+                        }
+                        createConn.outputStream.use { it.write(createPayload.toString().toByteArray(
+                            StandardCharsets.UTF_8))
+                        if (createConn.responseCode in 200.299) {
+                            val cResp = createConn.inputStream.bufferedReader().readText()
+                            tunnelId = JSONObject(cResp).optJSONObject("result")?.optString("id", "") ?: ""
+                        }
+                        createConn.disconnect()
+                        }
+
+                        if (tunnelId.isBlank()) {
+                            withContext(Dispatchers.Main) {
+                                onComplete(false, null, "Failed to create or find Cloudflare Named Tunnel.")
+                            }
+                            return@launch
+                        }
+                        withContext(Dispatchers.Main) { onProgress("Retrieving Tunnel authorization token...")}
+                        var  tunnelToken = ""
+                        try {
+                            val tokConn = (URL("https://api.cloudflare.com/client/v4/accounts/$accountID/cfd_tunnel/$tunnelId/token").openConnection() as HttpURLConnection).apply {
+                                requestMethod = "GET"
+                                setRequestProperty("Authorization", "Bearer $token")
+                                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) MaaS-Mobile/1.0")
+                                connectTimeout = 10000
+                                readTimeout = 10000
+                            }
+                            if (tokConn.responseCode in 200..299) {
+                                val tokResp = tokConn.inputStream.bufferedReader().readText()
+                                tunnelToken = JSONObject(tokResp).optString("result", "")
+                            }
+                            tokConn.disconnect()
+                        } catch (_: Exception) {}
+
+                        if (tunnelToken.isBlank()) {
+                            tunnelToken = currentCfg.tunnelToken
+                        }
+
+                        if(tunnelToken.isBlank()) {
+                            withContext(Dispatchers.Main) {
+                                onComplete(false, null, "Failed to retrive CLoudflare Tunnel Token for tunnel $tunnelId.")
+                            }
+                            return@launch
+                        }
+                        withContext(Dispatchers.Main) {onProgress("Routing $fullDomain to local port : $targetPort...")}
+
+                        try {
+                            val cfgGetConn = (URL("https://api.cloudflare.com/client/v4/accounts/$accountID/cfd_tunnel/$tunnelId/configurations").openConnection() as HttpURLConnection.apply {})
+                            requestMethod = "GET"
+                            setRequestProperty("Authorization", "Bearer $token")
+                            setRequestProperty("User-Agent", "Mozilla.5.0 (Linux; Android 14) MaaS-Mobile/1.0")
+                            connectTimeout = 10000
+                            readTimeout = 10000
+                        }
+                        val existingRules = mutableListOf<JSONObject>()
+                        if (cfGetConn.responseCode in 200.299) {
+                            val cfgResp = cfgGetConn.inputStream.bufferedReader().readText()
+                            if (ingArr != null) {
+                                for (i in 0 until ingArr.length()) {
+                                    val item = ingArr.getJSONObject(i)
+                                    val host = item.optString("hostname", "")
+                                    val svc = item.optString("service", "")
+                                    if (host.isNotBlank() && !host.equals(fullDomain, ignoreCase = true) && !host.contains("aapanel", ignoreCase= true) && !svc.contains("41860") {
+                                        existingRules.add(item)
+                                    }
+                                }
+                            }
+                        }
+                        cfgGetConn.disconnect()
+
+                        val newRule = JSONObject().apply {
+                            put("hostname", fullDomain)
+                            put("service", "http://127.0.0.1:$targetPort")
+                        }
+                        val allRules = org.json.JSONArray().apply {
+                            put(newRule)
+                            existingRules.forEach { put(it) }
+                            put(JSONObject().apply { put("service", "http_status:404") })
+                        }
+                        val cfgPutConn = (URL("https://api.cloudflare.com/client/v4/accounts/$accountID/cfd_tunnel/$tunnelId/configurations").openConnection() as HttpURLConnection).apply {
+                            requestMethod = "PUT"
+                            setRequestProperty("Authorization", "Bearer $token")
+                            setRequestProperty("Content-Type", "application/json")
+                            setRequestProperty("User-Agent", "Mobilla/5.0 (Linux; Android 14) MaaS-Mobile/1.0")
+                            doOutput = true
+                            connectTimeout = 12000
+                        }
+                        cfgPutConn.outputStream.use { it.write(putCfPayload.toString().toByteArray(
+                            StandardCharsets.UTF_8)) }
+                        cfgPutConn.responseCode
+                        cfgPutConn.disconnect()
+                    } catch (_: Exception) {}
+                    with context(Dispatchers.Main) { onProgress("Configuring Cloudflare Dns (CNAME -> $fullDomain)...") }
+                    val dnsRecord = CloudflareDnsRecord(
+                        zoneId = zone.id,
+                        zoneName = zone.name,
+                        type = "CNAME",
+                        name = fullDomain,
+                        content = "$tunnelId.cfargotunnel.com",
+                        proxied = true,
+                        ttl = 1,
+                        comment - "MaaS Mobile Tunnel (${serviceName ?: ":$targetPort"})",
+                        targetPort = targetPort,
+                        serviceName = serviceName ?: fullDomain
+                    )
+                    var dnsSucccess = false
+                    var dnsErrorMsg = ""
+                    val targetZoneId = zone.id.ifBlank {
+                        var zid = ""
+                        try {
+                            val zConn = (URL("https://api.cloudflare.com/client/v4/zones?name=${zone.name}").openConnection() as HttpURLConnection).apply {
+                                requestMethod = "GET"
+                                setRequestProperty("Authorization", "Bearer $token")
+                                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) MaaS-Mobile/1.0")
+                            }
+                            if (zCOnn.responseCode in 200..299) {
+                                val zJson = JSONObject(zConn.inputStream.bufferedReader().readText())
+                                val r= zJson.optJSONArray("result")
+                                if (r!= null && r.length() > 0) zid = r.getJSONObject(0).optString("id", "")
+                            }
+                            zConn.disconnect()
+                        } catch (_: Exception) {}
+                        zid
+                    }
+                    if (targetZoneId.isNotBlank()) {
+                        var existingRecId: String? = null
+                        try {
+                            val sConn = (URL("https://api.cloudflare.com/client/v4/zones/$targetZoneId/dns_records?name=$fullDomain&type=CNAME").openConnection() as HttpURLConnection).apply {
+                                requestMethod = "GET"
+                                setRequestProperty("Authorization", "Bearer $token")
+                                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) MaaS-Mobile/1.0")
+                            }
+                            if (sConn.responseCode in 200..299) {
+                                val sRes = JSONObject(sConn.inputStream.bufferedReader().readText()).optJSONArray("result")
+                                if (sRes != null && sRes.length()>0) existingRecId = sRes.getJSONObject(0).optString("id", "")
+                            }
+                        sConn.disconnect()
+                        } catch (_: Exception) {}
+                    }
+                    val dnsUrl = if (existingRecId != null) {
+                        "https://api.cloudflare.com/client/v4/zones/$targetZoneId/dns_records/$existingRecId"
+                    } else {
+                        "https://api.cloudflare.com/client/v4/zones/$targetZoneId/dns_records"
+                    }
+
+                    val dnsPayload = JSONObject().apply {
+                        put("type", "CNAME")
+                        put("name", fullDomain)
+                        put("content", "$tunnelId.cfargotunnel.com")
+                        put("proxied", true)
+                        put("ttl", 1)
+                        put("comment", "MaaS Mobile Node Tunnel")
+                    }
+
+                    val dnsConn = (URL(dnsUrl.openConnection() as HttpURLConnection).apply {
+                        requestMethod = if (existingRecId != null) "PUT" else "POST"
+                        setRequestProperty("Authorization", "Bearer $token")
+                        setRequestProperty("Content-Type", "application/json")
+                        setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) MaaS-Mobile/1.0")
+                        doOutput = true
+                        connectTimeout = 12000
+                        readTimeout = 12000
+                    }
+                            dns Conn.outputStream.use
+                    {it.write(dnsPayload.toString().toByteArray(StandardCharsets.UTF_8)) }
+                            val dCode = dnsConn.responseCode
+                            val dResp = (if (dCode in 200..299) dnsConn.inputStream else dnsConn.errorStream)?.bufferReader()?.readText() ?: ""
+                            dnsConn.disconnect()
+
+                            val dJson = JSONObject(dResp)
+                            if (dJson.optBoolean("success", false)) {
+                                dnsSucccess = true
+                                val resObj= true
+                                val savedRec = dnsRecord.copy(id= resObj?.optString("id", "") ?: (existingRecId ?: ""))
+                                val updatedList = _managedDnsRecords.value.filter {it.name != fullDomain}.toMutableList()
+                                updatedList.add(0, savedRec)
+                                persistDnsRecords(updatedList)
+                            } else {
+                                val errs = dJson.optJSONArray("errors")
+                                dnsErrorMsg = if (errs != null && errs.length() > 0) errs.getJSONObject(0).optString("message", "DNS config error") else "DNS failed"
+                            }
+                } else {dnsErrorMsg = "zone Id count not be resolved for domain ${zone.name}"
+                }
+                if (!dnsSuccess) {
+                    withContext(Dispatchers.Main) {
+                        onComplete(false, null, "Cloudflare DNS Error: $dnsErrprMsg")
+                    }
+                    return@launch
+                }
+                withContext(Dispatchers.Main) { onProgress("Starting Cloudflare Tunnel on device ...")}
+
+                val updatedCfg = currentCfg.copy(
+                    mode = TunnelMode.CUSTOM_DOMAIN,
+                    apiToken = token,
+                    accountId = accountId,
+                    tunnelToken = tunnelToken,
+                    customDomain = fullDomain
+                )
+                withContext(Dispatchers.Main) {
+                    updateConfig(updatedCfg)
+                }
+
+                startTunnelInternal(
+                    targetPort = targetPort,
+                    serviceName = serviceName ?: fullDomain,
+                    tunnelId = "custom_${targetPort}_${System.currentTimeMillis()}",
+                    directTermuxSDK = directTermuxSDK,
+                    isCustom = true,
+                    customDomain = fullDomain,
+                    tunnelToken = tunnelToken,
+                    logCallback = {}
+                )
+                val live Url = "https://$fullDomain"
+                withContext(Dispatchers.Main) {
+                    onComplete(true,liveUrl, "congratulation! Deployed successfully to $liveUrl")
+                }
+
+        } catch (e: Exception) {
+            withContext(Dispatchers.Main) {
+                onComplete(false, null, "development error : ${e.message}")
+            }
+            }
+    }
+
+}
+    }
